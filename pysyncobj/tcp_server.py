@@ -27,7 +27,7 @@ class TcpServer(object):
         self.__socket = None
         self.__fileno = None
         self.__keepalive = keepalive
-        self.__state = SERVER_STATE.UNBINDED
+        self.__state = SERVER_STATE.UNBINDED            # 未bind
         self.__onNewConnectionCallback = onNewConnection
         self.__connectionTimeout = connectionTimeout
 

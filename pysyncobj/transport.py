@@ -201,8 +201,7 @@ class TCPTransport(Transport):
         super(TCPTransport, self).__init__(syncObj, selfNode, otherNodes)
         self._syncObj = syncObj
         self._server = None
-        self._connections = {} # Node object -> TcpConnection object
-        self._unknownConnections = set() # set of TcpConnection objects
+        self._connections = {} # Node object -> TcpConnection object, 本节点到其他节点的TCP连接--自己主动发起的，其他节点发起的
         self._selfNode = selfNode
         self._selfIsReadonlyNode = selfNode is None
         self._nodes = set() # set of TCPNode
@@ -223,7 +222,7 @@ class TCPTransport(Transport):
             self.addNode(node)
 
         if not self._selfIsReadonlyNode:
-            self._createServer()
+            self._createServer()    # 启动server等待其他节点的连接
         else:
             self._ready = True
 

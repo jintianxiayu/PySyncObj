@@ -59,7 +59,8 @@ class _COMMAND_TYPE:
     MEMBERSHIP = 2
     VERSION = 3
 
-_bchr = functools.partial(struct.pack, 'B')
+# https://docs.python.org/zh-cn/3/library/struct.html#format-characters
+_bchr = functools.partial(struct.pack, 'B') # unsigned char, 整数
 
 
 class SyncObjException(Exception):
@@ -154,24 +155,35 @@ class SyncObj(object):
         self.__connectedNodes = set() # set of Node
         self.__nodeClass = nodeClass
 
-        self.__raftState = _RAFT_STATE.FOLLOWER
-        self.__raftCurrentTerm = 0
-        self.__votedForNodeId = None
+        # Raft算法相关状态
+        self.__raftState = _RAFT_STATE.FOLLOWER # 节点状态
+        self.__raftCurrentTerm = 0              # 节点所在任期
+        self.__votedForNodeId = None            # 节点的投票记录
         self.__votesCount = 0
-        self.__raftLeader = None
-        self.__raftElectionDeadline = monotonicTime() + self.__generateRaftTimeout()
-        self.__raftLog = createJournal(self.__conf.journalFile)
+        self.__raftLeader = None                # 已知的leader节点
+        self.__raftElectionDeadline = monotonicTime() + self.__generateRaftTimeout()    # leader心跳超时时间，follower感知后将发起新一轮选举
+        
+        # 其他节点复制到本节点的日志，各节点间会不一致，但最终一致； logEntry: (command, index, term)
+        self.__raftLog = createJournal(self.__conf.journalFile) 
         if len(self.__raftLog) == 0:
-            self.__raftLog.add(_bchr(_COMMAND_TYPE.NO_OP), 1, self.__raftCurrentTerm)
+            self.__raftLog.add(_bchr(_COMMAND_TYPE.NO_OP), 1, self.__raftCurrentTerm)   # 作用是啥？？
+        
+        # leader已提交的日志索引 -- leader先通过心跳(append_entries)消息将日志复制到其他节点，待收到大部分节点的响应后提交对应的日志--更新本地commitIndex，在下次心跳时通知其他节点日志已提交，其他节点在更新本地的commitIndex
+        # 已提交的日志会异步apply
         self.__raftCommitIndex = self.__raftLog.getRaftCommitIndex()
-        self.__raftLastApplied = 1
+         
+        # 已应用到状态机的日志索引，__raftCommitIndex >= __raftLastApplied, 差值部分就是还未应用到状态机的部分
+        self.__raftLastApplied = 1           
+
+        # 各节点的状态，供leader使用
         self.__raftNextIndex = {}
         self.__lastResponseTime = {}
         self.__raftMatchIndex = {}
+        
         self.__lastSerializedTime = monotonicTime()
         self.__lastSerializedEntry = None
         self.__forceLogCompaction = False
-        self.__leaderCommitIndex = None
+        self.__leaderCommitIndex = None     # 只赋值，没有使用，啥作用？？
         self.__onReadyCalled = False
         self.__changeClusterIDx = None
         self.__noopIDx = None
@@ -248,6 +260,9 @@ class SyncObj(object):
         self.__thread = None
         self.__mainThread = None
         self.__initialised = None
+
+        # 命令队列，对@replicated方法的调用、集群节点变更都会生成对应的command
+        # entry: (command, callback), command=type+data
         self.__commandsQueue = FastQueue(self.__conf.commandsQueueSize)
         if not self.__conf.appendEntriesUseBatch and PIPE_NOTIFIER_ENABLED:
             self.__pipeNotifier = PipeNotifier(self._poller)
@@ -269,9 +284,9 @@ class SyncObj(object):
         if self.__conf.autoTick:
             self.__mainThread = threading.current_thread()
             self.__initialised = threading.Event()
-            self.__thread = threading.Thread(target=SyncObj._autoTickThread, args=(weakref.proxy(self),))
+            self.__thread = threading.Thread(target=SyncObj._autoTickThread, args=(weakref.proxy(self),))   # tick thread
             self.__thread.start()
-            self.__initialised.wait()
+            self.__initialised.wait()   # 等待网络就绪
             # while not self.__initialised.is_set():
             #     pass
         else:
@@ -342,7 +357,10 @@ class SyncObj(object):
         self._applyCommand(pickle.dumps(newVersion), callback, _COMMAND_TYPE.VERSION)
 
     def addNodeToCluster(self, node, callback = None):
-        """Add single node to cluster (dynamic membership changes). Async.
+        """
+        向集群添加新节点(异步) -- 变更节点是改变集群状态的操作, 本质上也对应一条log
+
+        Add single node to cluster (dynamic membership changes). Async.
         You should wait until node successfully added before adding
         next node.
 
@@ -355,7 +373,7 @@ class SyncObj(object):
             raise Exception('dynamicMembershipChange is disabled')
         if not isinstance(node, Node):
             node = self.__nodeClass(node)
-        self._applyCommand(pickle.dumps(['add', node.id, node]), callback, _COMMAND_TYPE.MEMBERSHIP)
+        self._applyCommand(pickle.dumps(['add', node.id, node]), callback, _COMMAND_TYPE.MEMBERSHIP)    # 生成add command
 
     def removeNodeFromCluster(self, node, callback = None):
         """Remove single node from cluster (dynamic membership changes). Async.
@@ -420,6 +438,9 @@ class SyncObj(object):
         return self.__currentVersionFuncNames[funcName]
 
     def _applyCommand(self, command, callback, commandType = None):
+        '''
+        向commandQueues追加command
+        '''
         try:
             if commandType is None:
                 self.__commandsQueue.put_nowait((command, callback))
@@ -431,6 +452,11 @@ class SyncObj(object):
             self.__callErrCallback(FAIL_REASON.QUEUE_FULL, callback)
 
     def _checkCommandsToApply(self):
+        '''
+        从commandQueue中取出command处理：
+            - 若是leader:   生成log追加到__raftLogs, 之后异步复制到其他节点
+            - 若是folloer:  转发给leader
+        '''
         startTime = monotonicTime()
 
         while monotonicTime() - startTime < self.__conf.appendEntriesPeriod:
@@ -442,7 +468,7 @@ class SyncObj(object):
                 break
 
             requestNode, requestID = None, None
-            if isinstance(callback, tuple):
+            if isinstance(callback, tuple): # follower发的apply_command消息
                 requestNode, requestID = callback
 
             if self.__raftState == _RAFT_STATE.LEADER:
@@ -454,10 +480,10 @@ class SyncObj(object):
                     changeClusterRequest = None
 
                 if changeClusterRequest is None or self.__changeCluster(changeClusterRequest):
-
+                    # 非集群变更command，或 成功更新集群，追加log
                     self.__raftLog.add(command, idx, term)
 
-                    if requestNode is None:
+                    if requestNode is None: # leader发起的command
                         if callback is not None:
                             self.__commandsWaitingCommit[idx].append((term, callback))
                     else:
@@ -470,7 +496,7 @@ class SyncObj(object):
                     if not self.__conf.appendEntriesUseBatch:
                         self.__sendAppendEntries()
                 else:
-
+                    # changeClusterRequest非空，但无法更新集群
                     if requestNode is None:
                         if callback is not None:
                             callback(None, FAIL_REASON.REQUEST_DENIED)
@@ -482,6 +508,7 @@ class SyncObj(object):
                         })
 
             elif self.__raftLeader is not None:
+                # follower上生成的command, 转发到leader
                 if requestNode is None:
                     message = {
                         'type': 'apply_command',
@@ -489,6 +516,7 @@ class SyncObj(object):
                     }
 
                     if callback is not None:
+                        # 关联callback和requestID，待收到leader的apply_command_response后，再找出关联的callback执行
                         self.__commandsLocalCounter += 1
                         self.__commandsWaitingReply[self.__commandsLocalCounter] = callback
                         message['request_id'] = self.__commandsLocalCounter
@@ -512,6 +540,7 @@ class SyncObj(object):
         finally:
             self.__initialised.set()
         time.sleep(0.1)
+        
         try:
             while True:
                 if not self.__mainThread.is_alive():
@@ -519,6 +548,7 @@ class SyncObj(object):
                 if self.__destroying:
                     self._doDestroy()
                     break
+                
                 self._onTick(self.__conf.autoTickPeriod)
         except ReferenceError:
             pass
@@ -546,7 +576,7 @@ class SyncObj(object):
             self.__applyLogEntries()
             return
 
-        if self.__needLoadDumpFile:
+        if self.__needLoadDumpFile: # 只在第一次tick时执行一次
             if self.__conf.fullDumpFile is not None and os.path.isfile(self.__conf.fullDumpFile):
                 self.__loadDumpFile(clearJournal=False)
             self.__needLoadDumpFile = False
@@ -631,15 +661,19 @@ class SyncObj(object):
         self._poller.poll(timeToWait)
 
     def __applyLogEntries(self):
+        '''
+        找出已提交但未apply的日志, apply到本地
+        '''
         needSendAppendEntries = False
 
-        if self.__raftCommitIndex > self.__raftLastApplied:
+        if self.__raftCommitIndex > self.__raftLastApplied: # 存在未apply的日志
             count = self.__raftCommitIndex - self.__raftLastApplied
             entries = self.__getEntries(self.__raftLastApplied + 1, count)
             for entry in entries:
+                # entry：(command, index, term)
                 try:
                     currentTermID = entry[2]
-                    subscribers = self.__commandsWaitingCommit.pop(entry[1], [])
+                    subscribers = self.__commandsWaitingCommit.pop(entry[1], [])    # log对应的callbacks: (term, callback)
                     res = self.__doApplyCommand(entry[0])
                     for subscribeTermID, callback in subscribers:
                         if subscribeTermID == currentTermID:
@@ -944,7 +978,7 @@ class SyncObj(object):
             else:
                 self._applyCommand(message['command'], None)
 
-        if message['type'] == 'apply_command_response':
+        if message['type'] == 'apply_command_response': # leader对follower的apply_command消息的响应
             requestID = message['request_id']
             error = message.get('error', None)
             callback = self.__commandsWaitingReply.pop(requestID, None)
@@ -1255,7 +1289,7 @@ class SyncObj(object):
                 self.__changeClusterIDx = None
 
         # Previous cluster change request was not commited yet
-        if self.__changeClusterIDx is not None:
+        if self.__changeClusterIDx is not None: # 未发现__changeClusterIDx非空赋值逻辑，条件永不成立
             return False
 
         return self.__doChangeCluster(request)
@@ -1305,6 +1339,7 @@ class SyncObj(object):
             return True
 
     def __parseChangeClusterRequest(self, command):
+        # command: type+data
         commandType = ord(command[:1])
         if commandType != _COMMAND_TYPE.MEMBERSHIP:
             return None
@@ -1363,7 +1398,7 @@ class SyncObj(object):
 
     def __loadDumpFile(self, clearJournal):
         try:
-            data = self.__serializer.deserialize()
+            data = self.__serializer.deserialize()  # (data, lastAppliedEntries[1], lastAppliedEntries[0], cluster)
             if data[0] is not None:
                 if self.__consumers:
                     selfData = data[0][0]
